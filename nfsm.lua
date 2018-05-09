@@ -5,7 +5,7 @@ _M._VERSION = '1.0'
 local mt = { __index = _M }
 
 function _M.new(database)
-    return setmetatable({db = database}, mt)
+    return setmetatable({db = database, busy = false, evqueue = {}}, mt)
 end
 
 function _M.destroy(self)
@@ -36,7 +36,7 @@ local function _parse_data_trans(fsm, state_name, data_trans)
     trans.triggers = {}
 
     for i=1, #splits do
-        if utils.starts(splits[i], 'tm_') then
+        if utils.starts(splits[i], 'tm_') and fsm.timer then
             trans.triggers[splits[i] .. '_' .. fsm.name .. '_' .. state_name] = tonumber(splits[i]:sub(4, -1))
         else
             trans.triggers[splits[i]] = true
@@ -181,7 +181,9 @@ function _M.enter_state(self, state_name, external)
 
     self.curr_state_name = state_name
 
-    _start_state_timers(self, state)
+    if self.timer then
+        _start_state_timers(self, state)
+    end
 end
 
 function _M.exit_state(self, state_name)
@@ -208,7 +210,9 @@ function _M.exit_state(self, state_name)
         state.exit(self, state)
     end
 
-    _stop_state_timers(self, state)
+    if self.timer then
+        _stop_state_timers(self, state)
+    end
 end
 
 function _M.enter_init_state(self)
@@ -285,32 +289,32 @@ function _M.process_local_transitions(self, evtype, evdata)
     return false
 end
 
-function _M.process_external_transitions(self, evtype, evdata)
-    for idx, trans in ipairs(self.external_transitions) do
-        if trans.triggers[evtype] then
-            self:exit_state(self.curr_state_name)
-            self.curr_state_name = nil -- 這是 external transition 的 workaround
+-- function _M.process_external_transitions(self, evtype, evdata)
+--     for idx, trans in ipairs(self.external_transitions) do
+--         if trans.triggers[evtype] then
+--             self:exit_state(self.curr_state_name)
+--             self.curr_state_name = nil -- 這是 external transition 的 workaround
 
-            if self.parent and self.parent_state_name then
-                self.parent:exit_state(self.parent_state_name)
-                self.parent:enter_state(self.parent_state_name, 'external')
-            end
+--             if self.parent and self.parent_state_name then
+--                 self.parent:exit_state(self.parent_state_name)
+--                 self.parent:enter_state(self.parent_state_name, 'external')
+--             end
 
-            local dst = nil
-            if trans.action then
-                dst = trans.action(self, self.states[self.curr_state_name], evtype, evdata)
-            end
+--             local dst = nil
+--             if trans.action then
+--                 dst = trans.action(self, self.states[self.curr_state_name], evtype, evdata)
+--             end
 
-            if trans.dst then
-                dst = trans.dst
-            end
+--             if trans.dst then
+--                 dst = trans.dst
+--             end
 
-            self:enter_state(dst)
-            return true
-        end
-    end
-    return false
-end
+--             self:enter_state(dst)
+--             return true
+--         end
+--     end
+--     return false
+-- end
 
 function _M.process_internal_transitions(self, evtype, evdata)
     if not self.curr_state_name then
@@ -379,39 +383,59 @@ function _M.process_transitions(self, evtype, evdata)
     return false
 end
 
-function _M.update(self, evtype, evdata)
-    print(os.date("[%Y/%m/%d %H:%M:%S] ") .. self.name .. ' ' .. evtype .. ' received')
+local function _update_fsm(fsm, evtype, evdata)
+    print(os.date("[%Y/%m/%d %H:%M:%S] ") .. fsm.name .. ' ' .. evtype .. ' received')
 
-    if self:process_local_transitions(evtype, evdata) then
-        return true
+    if fsm:process_local_transitions(evtype, evdata) then
+        return
     end
 
-    if self:process_external_transitions(evtype, evdata) then
-        return true
+    -- if fsm:process_external_transitions(evtype, evdata) then
+    --     return
+    -- end
+
+    if not fsm.curr_state_name then
+        return
     end
 
-    if not self.curr_state_name then
-        return false
+    if fsm:process_internal_transitions(evtype, evdata) then
+        return
     end
 
-    if self:process_internal_transitions(evtype, evdata) then
-        return true
+    if fsm:process_transitions(evtype, evdata) then
+        return
     end
 
-    if self:process_transitions(evtype, evdata) then
-        return true
-    end
-
-    local sub_res = false
-    local state = self.states[self.curr_state_name]
+    local state = fsm.states[fsm.curr_state_name]
     if state and state.sub_fsms then
         for idx, sub in ipairs(state.sub_fsms) do
-            if sub:update(evtype, evdata) then
-                sub_res = true
-            end
+            _update_fsm(sub, evtype, evdata)
         end
     end
-    return sub_res
+    return
+end
+
+function _M.update(self, evtype, evdata)
+    local utils = require('utils')
+    if self.busy then
+        local ev    = {}
+        ev.evtype   = utils.deep_copy(evtype)
+        ev.evdata     = utils.deep_copy(evdata)
+        table.insert(self.evqueue, ev)
+        return
+    end
+
+    self.busy = true
+    _update_fsm(self, evtype, evdata)
+
+    while #self.evqueue >= 1 do
+        local ev = table.remove(self.evqueue, 1)
+        _update_fsm(self, ev.evtype, ev.evdata)
+        utils.free(ev)
+        ev = nil
+    end
+    self.busy = false
+    return
 end
 
 function _M.get_db(self)
